@@ -47,22 +47,7 @@ runs:
         IDV=$(. /usr/lib/os-release && echo ${ID}-${VERSION_ID})
         test "${IDV}" = "ubuntu-24.04"
         # plucky is the next release
-        # Ubuntu uses different mirrors for different architectures:
-        # - amd64: azure.archive.ubuntu.com/ubuntu (on Azure runners)
-        # - arm64: ports.ubuntu.com/ubuntu-ports
-        case "$(arch)" in
-          x86_64)
-            mirror="http://azure.archive.ubuntu.com/ubuntu"
-            ;;
-          aarch64)
-            mirror="http://ports.ubuntu.com/ubuntu-ports"
-            ;;
-          *)
-            echo "Unsupported architecture: $(arch)" >&2
-            exit 1
-            ;;
-        esac
-        echo "deb ${mirror} plucky universe main" | sudo tee /etc/apt/sources.list.d/plucky.list
+        echo 'deb http://azure.archive.ubuntu.com/ubuntu plucky universe main' | sudo tee /etc/apt/sources.list.d/plucky.list
         /bin/time -f '%E %C' sudo apt update
         # skopeo is currently older in plucky for some reason hence --allow-downgrades
         /bin/time -f '%E %C' sudo apt install -y --allow-downgrades crun/plucky podman/plucky skopeo/plucky just
@@ -73,13 +58,8 @@ runs:
         set -xeuo pipefail
         echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
         sudo udevadm control --reload-rules
-        # Only trigger if /dev/kvm exists (may not be available on arm64 runners)
-        if [ -e /dev/kvm ]; then
-          sudo udevadm trigger --name-match=kvm
-          ls -l /dev/kvm
-        else
-          echo "Note: /dev/kvm not available on this runner"
-        fi
+        sudo udevadm trigger --name-match=kvm
+        ls -l /dev/kvm
     # Used by a few workflows, but generally useful
     - name: Set architecture variable
       id: set_arch
@@ -91,6 +71,7 @@ runs:
       shell: bash
       run: |
         set -xeuo pipefail
+        # renovate: datasource=github-releases depName=bootc-dev/bcvk
         export BCVK_VERSION=0.10.0
         # see https://github.com/bootc-dev/bcvk/issues/176
         /bin/time -f '%E %C' sudo apt install -y libkrb5-dev pkg-config libvirt-dev genisoimage qemu-utils qemu-kvm virtiofsd libvirt-daemon-system python3-virt-firmware
