@@ -13,7 +13,7 @@ devenv-build-c10s:
 # Build devenv image with local tag (defaults to Debian)
 devenv-build: devenv-build-debian
 
-# Test devcontainer with a locally built image
+# Test devcontainer with a locally built image using podman
 # Usage: just devcontainer-test <os>
 # Example: just devcontainer-test debian
 devcontainer-test os:
@@ -31,5 +31,19 @@ devcontainer-test os:
 	npx @devcontainers/cli exec \
 	  --workspace-folder . \
 	  --docker-path podman \
+	  --config common/.devcontainer/devcontainer.json \
+	  /usr/libexec/devenv-selftest.sh
+
+# Test devcontainer with Docker (uses the published image by default)
+# Usage: just devcontainer-test-docker
+devcontainer-test-docker:
+	#!/bin/bash
+	set -euo pipefail
+	npx --yes @devcontainers/cli up \
+	  --workspace-folder . \
+	  --config common/.devcontainer/devcontainer.json \
+	  --remove-existing-container
+	npx @devcontainers/cli exec \
+	  --workspace-folder . \
 	  --config common/.devcontainer/devcontainer.json \
 	  /usr/libexec/devenv-selftest.sh
