@@ -57,8 +57,10 @@ runs:
         /bin/time -f '%E %C' sudo apt update
         # skopeo is currently older in plucky for some reason hence --allow-downgrades
         /bin/time -f '%E %C' sudo apt install -y --allow-downgrades crun/plucky podman/plucky skopeo/plucky just
-    # This is the default on e.g. Fedora derivatives, but not Debian
+    # This is the default on e.g. Fedora derivatives, but not Debian.
+    # Only needed when libvirt/virtualization is requested.
     - name: Enable unprivileged /dev/kvm access
+      if: ${{ inputs.libvirt == 'true' }}
       shell: bash
       run: |
         set -xeuo pipefail
