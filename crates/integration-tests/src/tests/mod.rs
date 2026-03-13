@@ -3,3 +3,4 @@
 pub mod cli;
 pub mod digest_stability;
 pub mod privileged;
+pub mod upgrade;

@@ -59,6 +59,10 @@ test-integration-vm: build _integration-container-build
         CFSCTL_PATH=$(pwd)/target/debug/cfsctl \
         cargo run -p integration-tests
 
+# Run the upgrade compatibility test (requires podman + network)
+test-upgrade: build
+    CFSCTL_PATH=$(pwd)/target/debug/cfsctl cargo run -p integration-tests -- test_upgrade_repo_readable_by_previous_version
+
 # Run everything: checks + full integration tests including VM
 ci: check test-integration-vm
 

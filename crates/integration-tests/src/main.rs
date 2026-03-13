@@ -70,6 +70,80 @@ pub(crate) fn create_test_rootfs(parent: &Path) -> Result<PathBuf> {
     Ok(root)
 }
 
+/// Create a minimal OCI image layout directory for testing using the ocidir crate.
+///
+/// Builds a single-layer image containing `usr/` and `hello.txt` with
+/// deterministic timestamps (mtime = 1234567890) so that the resulting
+/// composefs image ID is reproducible.
+///
+/// Returns the path to the OCI layout directory inside `parent`.
+pub(crate) fn create_oci_layout(parent: &Path) -> Result<PathBuf> {
+    use cap_std_ext::cap_std;
+    use ocidir::oci_spec::image::{
+        ImageConfigurationBuilder, Platform, PlatformBuilder, RootFsBuilder,
+    };
+
+    let oci_dir = parent.join("oci-image");
+    fs::create_dir_all(&oci_dir)?;
+
+    let dir = cap_std::fs::Dir::open_ambient_dir(&oci_dir, cap_std::ambient_authority())?;
+    let ocidir = ocidir::OciDir::ensure(dir)?;
+
+    // Create a new empty manifest
+    let mut manifest = ocidir.new_empty_manifest()?.build()?;
+
+    // Create config with architecture and OS
+    let rootfs = RootFsBuilder::default()
+        .typ("layers")
+        .diff_ids(Vec::<String>::new())
+        .build()?;
+    let mut config = ImageConfigurationBuilder::default()
+        .architecture("amd64")
+        .os("linux")
+        .rootfs(rootfs)
+        .build()?;
+
+    // Create a simple layer with a usr/ directory and one file
+    let mut layer_builder = ocidir.create_layer(None)?;
+    {
+        let mut dir_header = tar::Header::new_gnu();
+        dir_header.set_entry_type(tar::EntryType::Directory);
+        dir_header.set_size(0);
+        dir_header.set_mode(0o755);
+        dir_header.set_uid(0);
+        dir_header.set_gid(0);
+        dir_header.set_mtime(1234567890);
+        dir_header.set_cksum();
+        layer_builder.append_data(&mut dir_header, "usr/", &[] as &[u8])?;
+    }
+    {
+        let data = b"hello from test layer\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(1234567890);
+        header.set_cksum();
+        layer_builder.append_data(&mut header, "hello.txt", &data[..])?;
+    }
+    let layer = layer_builder.into_inner()?.complete()?;
+
+    // Push the layer to manifest and config
+    ocidir.push_layer(&mut manifest, &mut config, layer, "test layer", None);
+
+    // Create platform for the manifest
+    let platform: Platform = PlatformBuilder::default()
+        .architecture("amd64")
+        .os("linux")
+        .build()?;
+
+    // Insert manifest and config into the OCI directory
+    ocidir.insert_manifest_and_config(manifest, config, None, platform)?;
+
+    Ok(oci_dir)
+}
+
 fn main() {
     let args = Arguments::from_args();
 
