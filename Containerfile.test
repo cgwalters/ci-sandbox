@@ -1,0 +1,2 @@
+FROM docker.io/library/alpine:latest
+RUN echo "multiarch build test" > /test.txt

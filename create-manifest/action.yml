@@ -1,0 +1,158 @@
+# Assemble per-architecture images (pushed by build-push-image) into a
+# multi-arch manifest list and push it with the desired tags.
+#
+# This action downloads the digest artifacts produced by build-push-image,
+# creates a podman manifest with correct per-arch metadata, and pushes it
+# for each tag derived from docker/metadata-action (or supplied manually).
+#
+# Typical usage (runs after a matrix of build-push-image jobs):
+#
+#   manifest:
+#     needs: build
+#     runs-on: ubuntu-24.04
+#     steps:
+#       - uses: docker/metadata-action@v5
+#         id: meta
+#         with:
+#           images: ghcr.io/${{ github.repository }}
+#           tags: |
+#             type=raw,value=latest,enable={{is_default_branch}}
+#             type=sha,prefix={{branch}}-,format=short
+#       - uses: bootc-dev/actions/create-manifest@main
+#         with:
+#           image: ghcr.io/${{ github.repository }}
+#           tags: ${{ steps.meta.outputs.tags }}
+#
+name: 'Create Multi-Arch Manifest'
+description: 'Assemble per-arch images into a multi-arch manifest and push'
+inputs:
+  image:
+    description: 'Full registry image name without tag (must match build-push-image)'
+    required: true
+  tags:
+    description: >
+      Newline-separated list of fully qualified image tags to push
+      (e.g. output of docker/metadata-action).
+    required: true
+  labels:
+    description: >
+      Newline-separated list of OCI annotations to apply to the manifest index
+      (e.g. output of docker/metadata-action labels).  Format: key=value.
+    required: false
+    default: ''
+  artifact-pattern:
+    description: 'Download artifact name pattern (must match build-push-image output)'
+    required: false
+    default: 'container-digests-*'
+  cosign-key:
+    description: 'Cosign private key for signing (leave empty to skip signing)'
+    required: false
+    default: ''
+  registry-login-env:
+    description: >
+      Set to "true" if you have already logged in to the registry.
+      Otherwise the action will attempt to log in using GITHUB_TOKEN.
+    required: false
+    default: 'false'
+outputs:
+  digest:
+    description: 'Digest of the pushed manifest'
+    value: ${{ steps.push-manifest.outputs.digest }}
+runs:
+  using: 'composite'
+  steps:
+    - name: Download digest artifacts
+      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+      with:
+        path: ${{ runner.temp }}/digests
+        pattern: ${{ inputs.artifact-pattern }}
+        merge-multiple: true
+
+    - name: Login to GHCR
+      if: inputs.registry-login-env == 'false'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        LOGIN_USER: ${{ github.actor }}
+        REGISTRY: ${{ inputs.image }}
+      run: |
+        set -euo pipefail
+        registry_host="${REGISTRY%%/*}"
+        echo "${GITHUB_TOKEN}" | podman login -u "${LOGIN_USER}" --password-stdin "${registry_host}"
+
+    - name: Create and push manifest
+      id: push-manifest
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        TAGS: ${{ inputs.tags }}
+        LABELS: ${{ inputs.labels }}
+        DIGEST_DIR: ${{ runner.temp }}/digests
+      run: |
+        set -euo pipefail
+
+        # Each digest artifact is a file named by arch containing the digest.
+        # E.g. "amd64" contains "sha256:abc123..."
+        arch_count=0
+        for arch_file in "${DIGEST_DIR}"/*; do
+          [ -f "${arch_file}" ] || continue
+          arch_count=$((arch_count + 1))
+        done
+
+        if [ "${arch_count}" -eq 0 ]; then
+          echo "::error::No digest artifacts found in ${DIGEST_DIR}"
+          exit 1
+        fi
+        echo "Found ${arch_count} architecture(s)"
+
+        last_digest=""
+        while IFS= read -r tag; do
+          [ -z "${tag}" ] && continue
+          echo "Creating manifest for ${tag}"
+
+          podman manifest create "${tag}"
+
+          # Add each per-arch image with explicit --arch
+          for arch_file in "${DIGEST_DIR}"/*; do
+            [ -f "${arch_file}" ] || continue
+            arch="$(basename "${arch_file}")"
+            digest="$(< "${arch_file}")"
+            echo "  Adding ${arch}: ${digest}"
+            podman manifest add --arch "${arch}" "${tag}" "${IMAGE}@${digest}"
+          done
+
+          # Apply OCI annotations/labels if provided
+          if [ -n "${LABELS}" ]; then
+            while IFS= read -r label; do
+              [ -z "${label}" ] && continue
+              podman manifest annotate --index --annotation "${label}" "${tag}"
+            done <<< "${LABELS}"
+          fi
+
+          podman manifest push --all "${tag}" "${tag}"
+
+          # Capture the manifest digest from the push digestfile
+          last_digest="$(podman manifest inspect "${tag}" | jq -r '.digest')"
+        done <<< "${TAGS}"
+
+        if [ -z "${last_digest}" ]; then
+          echo "::error::Failed to determine manifest digest"
+          exit 1
+        fi
+
+        echo "digest=${last_digest}" >> "${GITHUB_OUTPUT}"
+
+    - name: Install Cosign
+      if: inputs.cosign-key != ''
+      uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd1d5ad67616257 # v3.5.0
+
+    - name: Sign manifest
+      if: inputs.cosign-key != ''
+      shell: bash
+      env:
+        COSIGN_PRIVATE_KEY: ${{ inputs.cosign-key }}
+        IMAGE: ${{ inputs.image }}
+        DIGEST: ${{ steps.push-manifest.outputs.digest }}
+      run: |
+        set -euo pipefail
+        cosign sign -y --key env://COSIGN_PRIVATE_KEY "${IMAGE}@${DIGEST}"

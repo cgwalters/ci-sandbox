@@ -1,0 +1,58 @@
+# Test workflow for build-push-image + create-manifest actions
+name: Test multiarch container build
+
+on:
+  push:
+    branches: [test-multiarch-build]
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}/test-multiarch
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./build-push-image
+        with:
+          image: ${{ env.IMAGE }}
+          arch: ${{ matrix.arch }}
+          containerfile: ./Containerfile.test
+          context: .
+
+  manifest:
+    name: Create manifest
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract metadata
+        uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+
+      - uses: ./create-manifest
+        with:
+          image: ${{ env.IMAGE }}
+          tags: ${{ steps.meta.outputs.tags }}

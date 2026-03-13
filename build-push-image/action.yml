@@ -1,0 +1,178 @@
+# Build a container image for a single architecture and push by digest to a
+# registry.  Designed to run inside a matrix strategy that fans out over
+# architectures; a companion `create-manifest` action assembles the per-arch
+# images into a multi-arch manifest list afterwards.
+#
+# The runner's native architecture must match the `arch` input — this action
+# does not do cross-compilation.  Use a matrix like:
+#
+#   strategy:
+#     matrix:
+#       arch: [amd64, arm64]
+#       include:
+#         - arch: amd64
+#           runner: ubuntu-24.04
+#         - arch: arm64
+#           runner: ubuntu-24.04-arm
+#   runs-on: ${{ matrix.runner }}
+#   steps:
+#     - uses: actions/checkout@v4
+#     - uses: bootc-dev/actions/build-push-image@main
+#       with:
+#         image: ghcr.io/${{ github.repository }}
+#         arch: ${{ matrix.arch }}
+#
+name: 'Build and Push Image'
+description: 'Build a container image for one architecture and push it by digest'
+inputs:
+  image:
+    description: 'Full registry image name without tag (e.g. ghcr.io/org/repo)'
+    required: true
+  arch:
+    description: >
+      Architecture label for this build (e.g. amd64, arm64).  Used for artifact
+      naming and manifest assembly — the runner must be the matching native arch.
+    required: true
+  containerfile:
+    description: 'Path to the Containerfile/Dockerfile'
+    required: false
+    default: './Containerfile'
+  context:
+    description: 'Build context directory'
+    required: false
+    default: '.'
+  build-args:
+    description: 'Newline-separated list of --build-arg values'
+    required: false
+    default: ''
+  local-image:
+    description: >
+      Reference to a pre-built local image to push instead of building.
+      When set, the build step is skipped entirely.  Useful when the caller
+      has a custom build process (e.g. `just container-build`).
+    required: false
+    default: ''
+  push:
+    description: 'Whether to push the image (set false for PR builds)'
+    required: false
+    default: 'true'
+  registry-login-env:
+    description: >
+      Set to "true" if you have already logged in to the registry.
+      Otherwise the action will attempt to log in using GITHUB_TOKEN.
+    required: false
+    default: 'false'
+  max-retries:
+    description: 'Number of push retries on transient failure'
+    required: false
+    default: '3'
+outputs:
+  digest:
+    description: 'The pushed image digest (sha256:...)'
+    value: ${{ steps.push.outputs.digest }}
+  local-image:
+    description: 'The local image reference that was built (or passed through)'
+    value: ${{ steps.resolve-image.outputs.local-image }}
+runs:
+  using: 'composite'
+  steps:
+    - name: Login to GHCR
+      if: inputs.push == 'true' && inputs.registry-login-env == 'false'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        LOGIN_USER: ${{ github.actor }}
+        REGISTRY: ${{ inputs.image }}
+      run: |
+        set -euo pipefail
+        # Extract registry host from the full image name
+        registry_host="${REGISTRY%%/*}"
+        echo "${GITHUB_TOKEN}" | podman login -u "${LOGIN_USER}" --password-stdin "${registry_host}"
+
+    - name: Build image
+      id: build
+      if: inputs.local-image == ''
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        CONTAINERFILE: ${{ inputs.containerfile }}
+        CONTEXT: ${{ inputs.context }}
+        BUILD_ARGS: ${{ inputs.build-args }}
+      run: |
+        set -euo pipefail
+        # Derive a local tag from the image basename
+        basename="${IMAGE##*/}"
+        local_image="localhost/${basename}:latest"
+
+        args=()
+        if [ -n "${BUILD_ARGS}" ]; then
+          while IFS= read -r arg; do
+            [ -n "$arg" ] && args+=(--build-arg "$arg")
+          done <<< "${BUILD_ARGS}"
+        fi
+        podman build -t "${local_image}" -f "${CONTAINERFILE}" ${args[@]+"${args[@]}"} "${CONTEXT}"
+
+        echo "local-image=${local_image}" >> "${GITHUB_OUTPUT}"
+
+    # Resolve the effective local image: either from the build step or the input
+    - name: Resolve local image
+      id: resolve-image
+      shell: bash
+      env:
+        INPUT_LOCAL_IMAGE: ${{ inputs.local-image }}
+        BUILT_LOCAL_IMAGE: ${{ steps.build.outputs.local-image }}
+      run: |
+        set -euo pipefail
+        if [ -n "${INPUT_LOCAL_IMAGE}" ]; then
+          echo "local-image=${INPUT_LOCAL_IMAGE}" >> "${GITHUB_OUTPUT}"
+        else
+          echo "local-image=${BUILT_LOCAL_IMAGE}" >> "${GITHUB_OUTPUT}"
+        fi
+
+    - name: Push by digest
+      id: push
+      if: inputs.push == 'true'
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        LOCAL_IMAGE: ${{ steps.resolve-image.outputs.local-image }}
+        ARCH: ${{ inputs.arch }}
+        MAX_RETRIES: ${{ inputs.max-retries }}
+      run: |
+        set -euo pipefail
+        # Tag the local image for the remote registry
+        podman tag "${LOCAL_IMAGE}" "${IMAGE}:latest"
+
+        digestfile="$(mktemp)"
+        pushed=false
+        for i in $(seq "${MAX_RETRIES}"); do
+          if podman push --digestfile="${digestfile}" "${IMAGE}:latest"; then
+            pushed=true
+            break
+          fi
+          echo "Push attempt ${i} failed, retrying in $((5 * i))s..."
+          sleep $((5 * i))
+        done
+        if [ "${pushed}" != "true" ]; then
+          echo "::error::Push failed after ${MAX_RETRIES} attempts"
+          exit 1
+        fi
+
+        digest="$(< "${digestfile}")"
+        echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+
+        # Write digest artifact for create-manifest; filename encodes
+        # the arch so the manifest job can associate digests with platforms.
+        artifact_dir="${RUNNER_TEMP}/build-push-image/digests"
+        mkdir -p "${artifact_dir}"
+        echo "${digest}" > "${artifact_dir}/${ARCH}"
+        echo "Pushed ${IMAGE}@${digest} (${ARCH})"
+
+    - name: Upload digest artifact
+      if: inputs.push == 'true'
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+      with:
+        name: container-digests-${{ inputs.arch }}
+        path: ${{ runner.temp }}/build-push-image/digests/*
+        if-no-files-found: error
+        retention-days: 1
