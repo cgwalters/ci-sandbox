@@ -128,30 +128,36 @@ runs:
           const labels = process.env.LABELS.split('\n').map(l => l.trim()).filter(Boolean);
 
           const digestfile = path.join(process.env.RUNNER_TEMP, 'manifest-digestfile');
+          const manifestName = `localhost/manifest-tmp:${Date.now()}`;
+
+          // Build the manifest once, then push to each tag
+          core.info(`Creating manifest: ${manifestName}`);
+          execFileSync('podman', ['manifest', 'create', manifestName], { stdio: 'inherit' });
 
           let lastDigest = '';
-          for (const tag of tags) {
-            core.info(`Creating manifest for ${tag}`);
-            execFileSync('podman', ['manifest', 'create', tag], { stdio: 'inherit' });
-
+          try {
             for (const { arch, digest } of entries) {
               core.info(`  Adding ${arch}: ${digest}`);
               execFileSync('podman', [
-                'manifest', 'add', '--arch', arch, tag, `${image}@${digest}`
+                'manifest', 'add', '--arch', arch, manifestName, `${image}@${digest}`
               ], { stdio: 'inherit' });
             }
 
             for (const label of labels) {
               execFileSync('podman', [
-                'manifest', 'annotate', '--index', '--annotation', label, tag
+                'manifest', 'annotate', '--index', '--annotation', label, manifestName
               ], { stdio: 'inherit' });
             }
 
-            execFileSync('podman', [
-              'manifest', 'push', '--all', '--digestfile', digestfile, tag, tag
-            ], { stdio: 'inherit' });
-
-            lastDigest = fs.readFileSync(digestfile, 'utf8').trim();
+            for (const tag of tags) {
+              core.info(`Pushing manifest as ${tag}`);
+              execFileSync('podman', [
+                'manifest', 'push', '--all', '--digestfile', digestfile, manifestName, tag
+              ], { stdio: 'inherit' });
+              lastDigest = fs.readFileSync(digestfile, 'utf8').trim();
+            }
+          } finally {
+            execFileSync('podman', ['manifest', 'rm', manifestName], { stdio: 'inherit' });
           }
 
           if (!lastDigest) {
