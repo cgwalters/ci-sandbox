@@ -94,6 +94,7 @@ runs:
         TAGS: ${{ inputs.tags }}
         LABELS: ${{ inputs.labels }}
         DIGEST_DIR: ${{ runner.temp }}/digests
+        RUNNER_TEMP: ${{ runner.temp }}
       with:
         script: |
           const { execFileSync } = require('child_process');
@@ -120,6 +121,8 @@ runs:
           const tags = process.env.TAGS.split('\n').map(t => t.trim()).filter(Boolean);
           const labels = process.env.LABELS.split('\n').map(l => l.trim()).filter(Boolean);
 
+          const digestfile = path.join(process.env.RUNNER_TEMP, 'manifest-digestfile');
+
           let lastDigest = '';
           for (const tag of tags) {
             core.info(`Creating manifest for ${tag}`);
@@ -138,10 +141,11 @@ runs:
               ], { stdio: 'inherit' });
             }
 
-            execFileSync('podman', ['manifest', 'push', '--all', tag, tag], { stdio: 'inherit' });
+            execFileSync('podman', [
+              'manifest', 'push', '--all', '--digestfile', digestfile, tag, tag
+            ], { stdio: 'inherit' });
 
-            const inspectOut = execFileSync('podman', ['manifest', 'inspect', tag], { encoding: 'utf8' });
-            lastDigest = JSON.parse(inspectOut).digest || '';
+            lastDigest = fs.readFileSync(digestfile, 'utf8').trim();
           }
 
           if (!lastDigest) {
