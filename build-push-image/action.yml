@@ -21,7 +21,7 @@
 #           runner: ubuntu-24.04-arm
 #   runs-on: ${{ matrix.runner }}
 #   steps:
-#     - uses: actions/checkout@v4
+#     - uses: actions/checkout@v6
 #     - uses: bootc-dev/actions/bootc-ubuntu-setup@main
 #     - uses: bootc-dev/actions/build-push-image@main
 #       with:
@@ -78,7 +78,7 @@ outputs:
     value: ${{ steps.push.outputs.digest }}
   local-image:
     description: 'The local image reference that was built (or passed through)'
-    value: ${{ steps.resolve-image.outputs.local-image }}
+    value: ${{ steps.build.outputs.local-image }}
 runs:
   using: 'composite'
   steps:
@@ -91,75 +91,83 @@ runs:
         REGISTRY: ${{ inputs.image }}
       run: |
         set -euo pipefail
-        # Extract registry host from the full image name
         registry_host="${REGISTRY%%/*}"
         echo "${GITHUB_TOKEN}" | podman login -u "${LOGIN_USER}" --password-stdin "${registry_host}"
 
     - name: Build image
       id: build
-      if: inputs.local-image == ''
-      shell: bash
+      uses: actions/github-script@v7
       env:
         IMAGE: ${{ inputs.image }}
         CONTAINERFILE: ${{ inputs.containerfile }}
         CONTEXT: ${{ inputs.context }}
         BUILD_ARGS: ${{ inputs.build-args }}
-      run: |
-        set -euo pipefail
-        # Derive a local tag from the image basename
-        basename="${IMAGE##*/}"
-        local_image="localhost/${basename}:latest"
+        LOCAL_IMAGE_INPUT: ${{ inputs.local-image }}
+      with:
+        script: |
+          const { execFileSync } = require('child_process');
 
-        args=()
-        if [ -n "${BUILD_ARGS}" ]; then
-          while IFS= read -r arg; do
-            [ -n "$arg" ] && args+=(--build-arg "$arg")
-          done <<< "${BUILD_ARGS}"
-        fi
-        podman build -t "${local_image}" -f "${CONTAINERFILE}" ${args[@]+"${args[@]}"} "${CONTEXT}"
+          // If caller provided a pre-built image, just pass it through
+          if (process.env.LOCAL_IMAGE_INPUT) {
+            core.setOutput('local-image', process.env.LOCAL_IMAGE_INPUT);
+            core.info(`Using pre-built image: ${process.env.LOCAL_IMAGE_INPUT}`);
+            return;
+          }
 
-        echo "local-image=${local_image}" >> "${GITHUB_OUTPUT}"
+          const image = process.env.IMAGE;
+          const basename = image.split('/').pop();
+          const localImage = `localhost/${basename}:latest`;
 
-    # Resolve the effective local image: either from the build step or the input
-    - name: Resolve local image
-      id: resolve-image
-      shell: bash
-      env:
-        INPUT_LOCAL_IMAGE: ${{ inputs.local-image }}
-        BUILT_LOCAL_IMAGE: ${{ steps.build.outputs.local-image }}
-      run: |
-        set -euo pipefail
-        if [ -n "${INPUT_LOCAL_IMAGE}" ]; then
-          echo "local-image=${INPUT_LOCAL_IMAGE}" >> "${GITHUB_OUTPUT}"
-        else
-          echo "local-image=${BUILT_LOCAL_IMAGE}" >> "${GITHUB_OUTPUT}"
-        fi
+          const args = ['build', '-t', localImage, '-f', process.env.CONTAINERFILE];
+          for (const line of process.env.BUILD_ARGS.split('\n')) {
+            const arg = line.trim();
+            if (arg) args.push('--build-arg', arg);
+          }
+          args.push(process.env.CONTEXT);
+
+          core.info(`Running: podman ${args.join(' ')}`);
+          execFileSync('podman', args, { stdio: 'inherit' });
+
+          core.setOutput('local-image', localImage);
 
     - name: Push by digest
       id: push
       if: inputs.push == 'true'
-      shell: bash
+      uses: actions/github-script@v7
       env:
         IMAGE: ${{ inputs.image }}
-        LOCAL_IMAGE: ${{ steps.resolve-image.outputs.local-image }}
+        LOCAL_IMAGE: ${{ steps.build.outputs.local-image }}
         ARCH: ${{ inputs.arch }}
         MAX_RETRIES: ${{ inputs.max-retries }}
-      run: |
-        set -euo pipefail
-        podman tag "${LOCAL_IMAGE}" "${IMAGE}:latest"
+        RUNNER_TEMP: ${{ runner.temp }}
+      with:
+        script: |
+          const { execFileSync } = require('child_process');
+          const fs = require('fs');
+          const path = require('path');
 
-        digestfile="$(mktemp)"
-        podman push --retry "${MAX_RETRIES}" --digestfile="${digestfile}" "${IMAGE}:latest"
+          const image = process.env.IMAGE;
+          const localImage = process.env.LOCAL_IMAGE;
+          const arch = process.env.ARCH;
+          const maxRetries = process.env.MAX_RETRIES;
 
-        digest="$(< "${digestfile}")"
-        echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+          execFileSync('podman', ['tag', localImage, `${image}:latest`], { stdio: 'inherit' });
 
-        # Write digest artifact for create-manifest; filename encodes
-        # the arch so the manifest job can associate digests with platforms.
-        artifact_dir="${RUNNER_TEMP}/build-push-image/digests"
-        mkdir -p "${artifact_dir}"
-        echo "${digest}" > "${artifact_dir}/${ARCH}"
-        echo "Pushed ${IMAGE}@${digest} (${ARCH})"
+          const digestfile = path.join(process.env.RUNNER_TEMP, 'push-digestfile');
+          execFileSync('podman', [
+            'push', '--retry', maxRetries, '--digestfile', digestfile, `${image}:latest`
+          ], { stdio: 'inherit' });
+
+          const digest = fs.readFileSync(digestfile, 'utf8').trim();
+
+          // Write digest artifact for create-manifest; filename encodes
+          // the arch so the manifest job can associate digests with platforms.
+          const artifactDir = path.join(process.env.RUNNER_TEMP, 'build-push-image', 'digests');
+          fs.mkdirSync(artifactDir, { recursive: true });
+          fs.writeFileSync(path.join(artifactDir, arch), digest);
+
+          core.info(`Pushed ${image}@${digest} (${arch})`);
+          core.setOutput('digest', digest);
 
     - name: Upload digest artifact
       if: inputs.push == 'true'

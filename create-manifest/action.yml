@@ -1,6 +1,11 @@
 # Assemble per-architecture images (pushed by build-push-image) into a
 # multi-arch manifest list and push it with the desired tags.
 #
+# Prerequisites:
+#   Use bootc-dev/actions/bootc-ubuntu-setup first to get an up-to-date
+#   podman.  The version shipped with ubuntu-24.04 is too old and has
+#   known bugs with manifest handling.
+#
 # This action downloads the digest artifacts produced by build-push-image,
 # creates a podman manifest with correct per-arch metadata, and pushes it
 # for each tag derived from docker/metadata-action (or supplied manually).
@@ -11,6 +16,7 @@
 #     needs: build
 #     runs-on: ubuntu-24.04
 #     steps:
+#       - uses: bootc-dev/actions/bootc-ubuntu-setup@main
 #       - uses: docker/metadata-action@v5
 #         id: meta
 #         with:
@@ -82,65 +88,67 @@ runs:
 
     - name: Create and push manifest
       id: push-manifest
-      shell: bash
+      uses: actions/github-script@v7
       env:
         IMAGE: ${{ inputs.image }}
         TAGS: ${{ inputs.tags }}
         LABELS: ${{ inputs.labels }}
         DIGEST_DIR: ${{ runner.temp }}/digests
-      run: |
-        set -euo pipefail
+      with:
+        script: |
+          const { execFileSync } = require('child_process');
+          const fs = require('fs');
+          const path = require('path');
 
-        # Each digest artifact is a file named by arch containing the digest.
-        # E.g. "amd64" contains "sha256:abc123..."
-        arch_count=0
-        for arch_file in "${DIGEST_DIR}"/*; do
-          [ -f "${arch_file}" ] || continue
-          arch_count=$((arch_count + 1))
-        done
+          const image = process.env.IMAGE;
+          const digestDir = process.env.DIGEST_DIR;
 
-        if [ "${arch_count}" -eq 0 ]; then
-          echo "::error::No digest artifacts found in ${DIGEST_DIR}"
-          exit 1
-        fi
-        echo "Found ${arch_count} architecture(s)"
+          // Read per-arch digest files (each named by arch, containing the digest)
+          const entries = fs.readdirSync(digestDir)
+            .filter(f => fs.statSync(path.join(digestDir, f)).isFile())
+            .map(arch => ({
+              arch,
+              digest: fs.readFileSync(path.join(digestDir, arch), 'utf8').trim()
+            }));
 
-        last_digest=""
-        while IFS= read -r tag; do
-          [ -z "${tag}" ] && continue
-          echo "Creating manifest for ${tag}"
+          if (entries.length === 0) {
+            core.setFailed(`No digest artifacts found in ${digestDir}`);
+            return;
+          }
+          core.info(`Found ${entries.length} architecture(s): ${entries.map(e => e.arch).join(', ')}`);
 
-          podman manifest create "${tag}"
+          const tags = process.env.TAGS.split('\n').map(t => t.trim()).filter(Boolean);
+          const labels = process.env.LABELS.split('\n').map(l => l.trim()).filter(Boolean);
 
-          # Add each per-arch image with explicit --arch
-          for arch_file in "${DIGEST_DIR}"/*; do
-            [ -f "${arch_file}" ] || continue
-            arch="$(basename "${arch_file}")"
-            digest="$(< "${arch_file}")"
-            echo "  Adding ${arch}: ${digest}"
-            podman manifest add --arch "${arch}" "${tag}" "${IMAGE}@${digest}"
-          done
+          let lastDigest = '';
+          for (const tag of tags) {
+            core.info(`Creating manifest for ${tag}`);
+            execFileSync('podman', ['manifest', 'create', tag], { stdio: 'inherit' });
 
-          # Apply OCI annotations/labels if provided
-          if [ -n "${LABELS}" ]; then
-            while IFS= read -r label; do
-              [ -z "${label}" ] && continue
-              podman manifest annotate --index --annotation "${label}" "${tag}"
-            done <<< "${LABELS}"
-          fi
+            for (const { arch, digest } of entries) {
+              core.info(`  Adding ${arch}: ${digest}`);
+              execFileSync('podman', [
+                'manifest', 'add', '--arch', arch, tag, `${image}@${digest}`
+              ], { stdio: 'inherit' });
+            }
 
-          podman manifest push --all "${tag}" "${tag}"
+            for (const label of labels) {
+              execFileSync('podman', [
+                'manifest', 'annotate', '--index', '--annotation', label, tag
+              ], { stdio: 'inherit' });
+            }
 
-          # Capture the manifest digest from the push digestfile
-          last_digest="$(podman manifest inspect "${tag}" | jq -r '.digest')"
-        done <<< "${TAGS}"
+            execFileSync('podman', ['manifest', 'push', '--all', tag, tag], { stdio: 'inherit' });
 
-        if [ -z "${last_digest}" ]; then
-          echo "::error::Failed to determine manifest digest"
-          exit 1
-        fi
+            const inspectOut = execFileSync('podman', ['manifest', 'inspect', tag], { encoding: 'utf8' });
+            lastDigest = JSON.parse(inspectOut).digest || '';
+          }
 
-        echo "digest=${last_digest}" >> "${GITHUB_OUTPUT}"
+          if (!lastDigest) {
+            core.setFailed('Failed to determine manifest digest');
+            return;
+          }
+          core.setOutput('digest', lastDigest);
 
     - name: Install Cosign
       if: inputs.cosign-key != ''
