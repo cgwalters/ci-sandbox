@@ -89,6 +89,8 @@ runs:
         set -euo pipefail
         registry_host="${REGISTRY%%/*}"
         echo "${GITHUB_TOKEN}" | podman login -u "${LOGIN_USER}" --password-stdin "${registry_host}"
+        # Cosign uses the Docker credential store for pushing signatures
+        echo "${GITHUB_TOKEN}" | docker login -u "${LOGIN_USER}" --password-stdin "${registry_host}"
 
     - name: Create and push manifest
       id: push-manifest
