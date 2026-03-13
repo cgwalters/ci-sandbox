@@ -12,6 +12,7 @@ env:
 permissions:
   contents: read
   packages: write
+  id-token: write
 
 jobs:
   build:
@@ -27,7 +28,7 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: bootc-dev/actions/bootc-ubuntu-setup@main
 
@@ -43,7 +44,7 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: bootc-dev/actions/bootc-ubuntu-setup@main
 
@@ -56,7 +57,23 @@ jobs:
             type=raw,value=latest
             type=sha,format=short
 
+      # Generate a throwaway cosign keypair for testing the signing path.
+      # Real consumers would use a secret stored in repo settings.
+      - uses: sigstore/cosign-installer@v3
+      - name: Generate test cosign keypair
+        shell: bash
+        run: |
+          set -euo pipefail
+          COSIGN_PASSWORD="" cosign generate-key-pair
+          # Multiline secret needs to go through a file-based env approach
+          {
+            echo "COSIGN_TEST_KEY<<COSIGN_EOF"
+            cat cosign.key
+            echo "COSIGN_EOF"
+          } >> "$GITHUB_ENV"
+
       - uses: ./create-manifest
         with:
           image: ${{ env.IMAGE }}
           tags: ${{ steps.meta.outputs.tags }}
+          cosign-key: ${{ env.COSIGN_TEST_KEY }}

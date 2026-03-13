@@ -54,6 +54,10 @@ inputs:
     description: 'Cosign private key for signing (leave empty to skip signing)'
     required: false
     default: ''
+  cosign-password:
+    description: 'Password for the cosign private key (if encrypted)'
+    required: false
+    default: ''
   registry-login-env:
     description: >
       Set to "true" if you have already logged in to the registry.
@@ -163,6 +167,7 @@ runs:
       shell: bash
       env:
         COSIGN_PRIVATE_KEY: ${{ inputs.cosign-key }}
+        COSIGN_PASSWORD: ${{ inputs.cosign-password }}
         IMAGE: ${{ inputs.image }}
         DIGEST: ${{ steps.push-manifest.outputs.digest }}
       run: |
