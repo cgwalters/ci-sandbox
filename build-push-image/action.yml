@@ -170,7 +170,7 @@ runs:
 
     - name: Upload digest artifact
       if: inputs.push == 'true'
-      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+      uses: actions/upload-artifact@v4
       with:
         name: container-digests-${{ inputs.arch }}
         path: ${{ runner.temp }}/build-push-image/digests/*

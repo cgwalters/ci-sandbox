@@ -1,0 +1,78 @@
+# Build and publish the devaipod container image to ghcr.io
+#
+# Uses bootc-dev/actions for multi-arch build + manifest assembly.
+# The custom build command (`just container-build`) produces
+# localhost/devaipod:latest, which is passed via `local-image`.
+name: Build Container
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup host (newer podman, just)
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+
+      - name: Build and test container
+        run: just container-test
+
+  push:
+    if: github.event_name != 'pull_request'
+    needs: build-and-test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup host (newer podman, just)
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+
+      - name: Build container
+        run: just container-build
+
+      - uses: bootc-dev/actions/build-push-image@main
+        with:
+          image: ${{ env.IMAGE }}
+          arch: ${{ matrix.arch }}
+          local-image: localhost/devaipod:latest
+
+  manifest:
+    needs: push
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix={{branch}}-,format=short,enable=${{ github.ref_type != 'tag' }}
+            type=ref,event=tag
+
+      - uses: bootc-dev/actions/create-manifest@main
+        with:
+          image: ${{ env.IMAGE }}
+          tags: ${{ steps.meta.outputs.tags }}

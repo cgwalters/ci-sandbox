@@ -1,0 +1,101 @@
+---
+name: Build container image
+
+on:
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: "05 10 * * *" # 10:05am UTC everyday
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "**/README.md"
+  workflow_dispatch:
+
+env:
+  IMAGE_DESC: "Experimental debian-bootc POC image"
+  IMAGE_KEYWORDS: "bootc,debian"
+  IMAGE_LOGO_URL: "https://avatars.githubusercontent.com/u/230667510?s=400&u=cb912a5db49aee164a609a0fb4967d2d8170feb9&v=4"
+  IMAGE_NAME: "${{ github.event.repository.name }}"
+  IMAGE_REGISTRY: "ghcr.io/${{ github.repository_owner }}"
+  IMAGE: "ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}"
+  DEFAULT_TAG: "latest"
+
+jobs:
+  build_push:
+    name: Build and push image
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    timeout-minutes: 60
+    strategy:
+      fail-fast: true
+      matrix:
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - uses: bootc-dev/actions/build-push-image@main
+        with:
+          image: ${{ env.IMAGE }}
+          arch: ${{ matrix.arch }}
+          push: ${{ github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+  manifest:
+    name: Create manifest
+    needs: build_push
+    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Get current date
+        id: date
+        run: echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${GITHUB_OUTPUT}"
+
+      - name: Image metadata
+        uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=${{ env.DEFAULT_TAG }}
+            type=raw,value=${{ env.DEFAULT_TAG }}.{{date 'YYYYMMDD'}}
+            type=raw,value={{date 'YYYYMMDD'}}
+            type=ref,event=pr
+            type=sha,enable=${{ github.event_name == 'pull_request' }}
+          labels: |
+            containers.bootc=1
+            io.artifacthub.package.deprecated=false
+            io.artifacthub.package.keywords=${{ env.IMAGE_KEYWORDS }}
+            io.artifacthub.package.license=Apache-2.0
+            io.artifacthub.package.logo-url=${{ env.IMAGE_LOGO_URL }}
+            io.artifacthub.package.prerelease=false
+            io.artifacthub.package.readme-url=https://raw.githubusercontent.com/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}/${{ github.sha }}/README.md
+            org.opencontainers.image.created=${{ steps.date.outputs.date }}
+            org.opencontainers.image.description=${{ env.IMAGE_DESC }}
+            org.opencontainers.image.documentation=https://raw.githubusercontent.com/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}/${{ github.sha }}/README.md
+            org.opencontainers.image.source=https://github.com/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}/blob/${{ github.sha }}/Containerfile
+            org.opencontainers.image.title=${{ env.IMAGE_NAME }}
+            org.opencontainers.image.url=https://github.com/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}/tree/${{ github.sha }}
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+            org.opencontainers.image.version=${{ env.DEFAULT_TAG }}.{{date 'YYYYMMDD'}}
+
+      - uses: bootc-dev/actions/create-manifest@main
+        with:
+          image: ${{ env.IMAGE }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cosign-key: ${{ secrets.SIGNING_SECRET }}
