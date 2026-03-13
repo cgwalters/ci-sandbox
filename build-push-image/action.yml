@@ -3,6 +3,11 @@
 # architectures; a companion `create-manifest` action assembles the per-arch
 # images into a multi-arch manifest list afterwards.
 #
+# Prerequisites:
+#   Use bootc-dev/actions/bootc-ubuntu-setup first to get an up-to-date
+#   podman.  The version shipped with ubuntu-24.04 is too old and has
+#   known bugs with manifest handling and push-by-digest.
+#
 # The runner's native architecture must match the `arch` input — this action
 # does not do cross-compilation.  Use a matrix like:
 #
@@ -17,6 +22,7 @@
 #   runs-on: ${{ matrix.runner }}
 #   steps:
 #     - uses: actions/checkout@v4
+#     - uses: bootc-dev/actions/bootc-ubuntu-setup@main
 #     - uses: bootc-dev/actions/build-push-image@main
 #       with:
 #         image: ghcr.io/${{ github.repository }}
@@ -140,23 +146,10 @@ runs:
         MAX_RETRIES: ${{ inputs.max-retries }}
       run: |
         set -euo pipefail
-        # Tag the local image for the remote registry
         podman tag "${LOCAL_IMAGE}" "${IMAGE}:latest"
 
         digestfile="$(mktemp)"
-        pushed=false
-        for i in $(seq "${MAX_RETRIES}"); do
-          if podman push --digestfile="${digestfile}" "${IMAGE}:latest"; then
-            pushed=true
-            break
-          fi
-          echo "Push attempt ${i} failed, retrying in $((5 * i))s..."
-          sleep $((5 * i))
-        done
-        if [ "${pushed}" != "true" ]; then
-          echo "::error::Push failed after ${MAX_RETRIES} attempts"
-          exit 1
-        fi
+        podman push --retry "${MAX_RETRIES}" --digestfile="${digestfile}" "${IMAGE}:latest"
 
         digest="$(< "${digestfile}")"
         echo "digest=${digest}" >> "${GITHUB_OUTPUT}"

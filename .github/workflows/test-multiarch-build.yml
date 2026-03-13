@@ -29,6 +29,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: bootc-dev/actions/bootc-ubuntu-setup@main
+
       - uses: ./build-push-image
         with:
           image: ${{ env.IMAGE }}
@@ -42,6 +44,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+
+      - uses: bootc-dev/actions/bootc-ubuntu-setup@main
 
       - name: Extract metadata
         uses: docker/metadata-action@v5
