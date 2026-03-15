@@ -18,7 +18,8 @@ ARG COMPOSEFS_RS_REF
 
 RUN dnf -y install cargo rust openssl-devel git && dnf clean all
 RUN GIT_TERMINAL_PROMPT=0 git -c credential.helper= clone --branch "${COMPOSEFS_RS_REF}" --depth=1 \
-        "${COMPOSEFS_RS_REPO}" /src/composefs-rs
+        "${COMPOSEFS_RS_REPO}" /src/composefs-rs && \
+    echo "composefs-rs HEAD: $(git -C /src/composefs-rs rev-parse HEAD)"
 RUN cargo build --release --manifest-path /src/composefs-rs/Cargo.toml \
         -p cfsctl --features composefs-oci/oci-client
 
