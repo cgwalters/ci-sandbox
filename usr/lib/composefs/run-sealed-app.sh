@@ -65,7 +65,9 @@ cat > "${BUNDLE}/config.json" <<'OCICFG'
     { "destination": "/tmp",     "type": "tmpfs",  "source": "tmpfs",  "options": ["nosuid","nodev"] },
     { "destination": "/run",     "type": "tmpfs",  "source": "tmpfs",  "options": ["nosuid","nodev","mode=755"] },
     { "destination": "/var/run", "type": "tmpfs",  "source": "tmpfs",  "options": ["nosuid","nodev","mode=755"] },
-    { "destination": "/var/log", "type": "tmpfs",  "source": "tmpfs",  "options": ["nosuid","nodev"] }
+    { "destination": "/var/log", "type": "tmpfs",  "source": "tmpfs",  "options": ["nosuid","nodev"] },
+    { "destination": "/var/log/httpd", "type": "tmpfs",  "source": "tmpfs",  "options": ["nosuid","nodev"] },
+    { "destination": "/run/httpd",     "type": "tmpfs",  "source": "tmpfs",  "options": ["nosuid","nodev","mode=755"] }
   ]
 }
 OCICFG
