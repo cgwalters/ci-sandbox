@@ -7,23 +7,10 @@
 # The composefs digest gets injected into the kernel cmdline by
 # `bootc install` at deploy time — the Containerfile just builds
 # the OS content layer.
+#
+# cfsctl is built outside this Containerfile (in the GHA workflow or
+# locally via `just build-cfsctl`) and passed via build context.
 
-# --- Stage 1: Build cfsctl from composefs-rs source ---
-ARG COMPOSEFS_RS_REPO=https://github.com/cgwalters/ci-sandbox
-ARG COMPOSEFS_RS_REF=composefs
-
-FROM quay.io/centos/centos:stream10 AS build
-ARG COMPOSEFS_RS_REPO
-ARG COMPOSEFS_RS_REF
-
-RUN dnf -y install cargo rust openssl-devel git && dnf clean all
-RUN GIT_TERMINAL_PROMPT=0 git -c credential.helper= clone --branch "${COMPOSEFS_RS_REF}" --depth=1 \
-        "${COMPOSEFS_RS_REPO}" /src/composefs-rs && \
-    echo "composefs-rs HEAD: $(git -C /src/composefs-rs rev-parse HEAD)"
-RUN cargo build --release --manifest-path /src/composefs-rs/Cargo.toml \
-        -p cfsctl --features composefs-oci/oci-client
-
-# --- Stage 2: The actual bootc host image ---
 FROM quay.io/centos-bootc/centos-bootc:stream10
 
 # The sealed app image to pull at boot (override via --build-arg)
@@ -32,8 +19,9 @@ ARG SEALED_APP_IMAGE=docker://ghcr.io/cgwalters/ci-sandbox/sealed-app:latest
 # Install container runtime for running sealed app containers
 RUN dnf -y install crun && dnf clean all
 
-# Install cfsctl built from source in stage 1
-COPY --from=build /src/composefs-rs/target/release/cfsctl /usr/bin/cfsctl
+# Install cfsctl — pre-built binary from the build context
+COPY cfsctl /usr/bin/cfsctl
+RUN chmod +x /usr/bin/cfsctl
 
 # Embed the composefs app-signing certificate (public key — not secret).
 # At boot, a systemd service loads this into the kernel .fs-verity keyring.

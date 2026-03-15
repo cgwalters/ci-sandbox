@@ -116,8 +116,11 @@ jobs:
           oras discover --format tree ${APP_IMAGE}:latest
 
       # -- Build and push the host image --
-      - name: Prepare signing cert for host build
+      - name: Prepare host build context
         run: |
+          # Copy the CI-built cfsctl into the build context (same binary
+          # used for seal/sign, guaranteed to have oci-client + tag scheme fallback)
+          cp /tmp/composefs-rs/target/release/cfsctl cfsctl
           if [ -f /tmp/keys/composefs-signing.pem ]; then
             cp /tmp/keys/composefs-signing.pem app-signing-cert.pem
           else
@@ -129,10 +132,10 @@ jobs:
 
       - name: Build host image
         run: |
-          podman build --no-cache -f Containerfile.host \
+          podman build -f Containerfile.host \
             --build-arg SEALED_APP_IMAGE=docker://${APP_IMAGE}:latest \
             -t localhost/sealed-host:latest .
-          rm -f app-signing-cert.pem
+          rm -f app-signing-cert.pem cfsctl
 
       - name: Verify cfsctl in host image
         run: podman run --rm localhost/sealed-host:latest cfsctl --version
