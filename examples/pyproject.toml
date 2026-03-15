@@ -1,5 +1,0 @@
-[tool.pytest.ini_options]
-addopts = "--strict-markers -v"
-asyncio_mode = "auto"
-pythonpath = "."
-testpaths = ["test"]

@@ -1,0 +1,44 @@
+name: Build sealed composefs demo
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-host:
+    name: Build sealed host image
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bootc-dev/actions/bootc-ubuntu-setup@main
+
+      - name: Generate ephemeral signing keypair
+        run: |
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout composefs-signing.key \
+            -out app-signing-cert.pem \
+            -days 1 -subj '/CN=composefs-ci-ephemeral/'
+
+      - name: Build host image
+        run: podman build -f Containerfile.host -t localhost/sealed-host:latest .
+
+      - name: Verify cfsctl in image
+        run: podman run --rm localhost/sealed-host:latest cfsctl --version
+
+  build-app:
+    name: Build app image
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bootc-dev/actions/bootc-ubuntu-setup@main
+
+      - name: Build app image
+        run: podman build -f Containerfile.app -t localhost/sealed-app:latest .

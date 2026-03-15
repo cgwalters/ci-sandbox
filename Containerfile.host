@@ -1,0 +1,51 @@
+# Containerfile.host — Sealed bootc host image with composefs app signing
+#
+# CentOS Stream 10 bootc already ships the composefs dracut module,
+# composefs-setup-root, SELinux policy, and systemd-networkd config.
+# We only add: cfsctl, crun, and the app-signing certificate + loader.
+#
+# The composefs digest gets injected into the kernel cmdline by
+# `bootc install` at deploy time — the Containerfile just builds
+# the OS content layer.
+
+# --- Stage 1: Build cfsctl from composefs-rs source ---
+ARG COMPOSEFS_RS_REPO=https://github.com/cgwalters/ci-sandbox
+ARG COMPOSEFS_RS_REF=composefs
+
+FROM quay.io/centos/centos:stream10 AS build
+ARG COMPOSEFS_RS_REPO
+ARG COMPOSEFS_RS_REF
+
+RUN dnf -y install cargo rust openssl-devel git && dnf clean all
+RUN GIT_TERMINAL_PROMPT=0 git -c credential.helper= clone --branch "${COMPOSEFS_RS_REF}" --depth=1 \
+        "${COMPOSEFS_RS_REPO}" /src/composefs-rs
+RUN cargo build --release --manifest-path /src/composefs-rs/Cargo.toml -p cfsctl
+
+# --- Stage 2: The actual bootc host image ---
+FROM quay.io/centos-bootc/centos-bootc:stream10
+
+# Install container runtime for running sealed app containers
+RUN dnf -y install crun && dnf clean all
+
+# Install cfsctl built from source in stage 1
+COPY --from=build /src/composefs-rs/target/release/cfsctl /usr/bin/cfsctl
+
+# Embed the composefs app-signing certificate (public key — not secret).
+# At boot, a systemd service loads this into the kernel .fs-verity keyring.
+COPY app-signing-cert.pem /usr/lib/composefs/app-signing-cert.pem
+
+# Systemd service + script to load the signing cert into the kernel keyring
+COPY etc/systemd/system/composefs-load-appkeys.service /etc/systemd/system/
+COPY usr/lib/composefs/load-app-keys.sh /usr/lib/composefs/
+
+# Sealed httpd application service (pulls, mounts, and runs a signed app image)
+COPY etc/default/sealed-httpd /etc/default/sealed-httpd
+COPY etc/systemd/system/sealed-httpd.service /etc/systemd/system/
+COPY usr/lib/composefs/run-sealed-app.sh /usr/lib/composefs/
+COPY usr/lib/composefs/stop-sealed-app.sh /usr/lib/composefs/
+
+RUN chmod +x /usr/lib/composefs/load-app-keys.sh \
+             /usr/lib/composefs/run-sealed-app.sh \
+             /usr/lib/composefs/stop-sealed-app.sh && \
+    systemctl enable composefs-load-appkeys.service && \
+    systemctl enable sealed-httpd.service
