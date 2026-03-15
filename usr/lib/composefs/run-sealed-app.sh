@@ -44,7 +44,12 @@ cat > "${BUNDLE}/config.json" <<'OCICFG'
       "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
       "LANG=C.UTF-8"
     ],
-    "cwd": "/"
+    "cwd": "/",
+    "capabilities": {
+      "bounding":    ["CAP_NET_BIND_SERVICE","CAP_SETUID","CAP_SETGID","CAP_KILL","CAP_CHOWN","CAP_DAC_OVERRIDE","CAP_FOWNER","CAP_SYS_CHROOT"],
+      "effective":   ["CAP_NET_BIND_SERVICE","CAP_SETUID","CAP_SETGID","CAP_KILL","CAP_CHOWN","CAP_DAC_OVERRIDE","CAP_FOWNER","CAP_SYS_CHROOT"],
+      "permitted":   ["CAP_NET_BIND_SERVICE","CAP_SETUID","CAP_SETGID","CAP_KILL","CAP_CHOWN","CAP_DAC_OVERRIDE","CAP_FOWNER","CAP_SYS_CHROOT"]
+    }
   },
   "root": {
     "path": "rootfs",
