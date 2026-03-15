@@ -52,7 +52,7 @@ def run(cmd, **kwargs):
 
 
 def openssl(*args):
-    run(["openssl", *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    run(["openssl", *args], stdout=subprocess.DEVNULL)
 
 
 def generate_keys(output_dir: Path):
@@ -90,15 +90,15 @@ def generate_keys(output_dir: Path):
     else:
         print(f"  create cosign keypair (ECDSA P-256)")
         openssl(
-            "ecparam",
-            "-genkey",
-            "-name",
-            "prime256v1",
-            "-noout",
+            "genpkey",
+            "-algorithm",
+            "EC",
+            "-pkeyopt",
+            "ec_paramgen_curve:prime256v1",
             "-out",
             str(cosign_key),
         )
-        openssl("ec", "-in", str(cosign_key), "-pubout", "-out", str(cosign_pub))
+        openssl("pkey", "-in", str(cosign_key), "-pubout", "-out", str(cosign_pub))
 
     # -- Secure Boot (PK, KEK, db — RSA-2048) --
     guid_file = output_dir / "sb-guid.txt"
