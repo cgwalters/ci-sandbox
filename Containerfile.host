@@ -8,8 +8,15 @@
 # `bootc install` at deploy time — the Containerfile just builds
 # the OS content layer.
 #
-# cfsctl is built outside this Containerfile (in the GHA workflow or
-# locally via `just build-cfsctl`) and passed via build context.
+# cfsctl is fetched as a pre-built OCI artifact via oras.
+
+ARG CFSCTL_IMAGE=ghcr.io/cgwalters/ci-sandbox/cfsctl:composefs
+FROM quay.io/centos/centos:stream10 AS fetch-cfsctl
+ARG CFSCTL_IMAGE
+RUN dnf -y install tar gzip && dnf clean all
+RUN curl -sLO "https://github.com/oras-project/oras/releases/download/v1.3.1/oras_1.3.1_linux_amd64.tar.gz" && \
+    tar xzf oras_1.3.1_linux_amd64.tar.gz oras && rm oras_1.3.1_linux_amd64.tar.gz
+RUN ./oras pull "${CFSCTL_IMAGE}" && chmod +x cfsctl
 
 FROM quay.io/centos-bootc/centos-bootc:stream10
 
@@ -19,9 +26,8 @@ ARG SEALED_APP_IMAGE=docker://ghcr.io/cgwalters/ci-sandbox/sealed-app:latest
 # Install container runtime for running sealed app containers
 RUN dnf -y install crun && dnf clean all
 
-# Install cfsctl — pre-built binary from the build context
-COPY cfsctl /usr/bin/cfsctl
-RUN chmod +x /usr/bin/cfsctl
+# Install cfsctl — pre-built binary fetched via oras
+COPY --from=fetch-cfsctl /cfsctl /usr/bin/cfsctl
 
 # Embed the composefs app-signing certificate (public key — not secret).
 # At boot, a systemd service loads this into the kernel .fs-verity keyring.
