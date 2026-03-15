@@ -1,9 +1,10 @@
 # Configuration for sealed-httpd.service
 #
-# Override at deploy time to point at your signed image registry.
+# This value is injected at build time by Containerfile.host.
+# Override at deploy time to point at a different signed image.
 
 # Image to pull (OCI transport URI)
-SEALED_APP_IMAGE=docker://ghcr.io/example/sealed-httpd:latest
+SEALED_APP_IMAGE=docker://ghcr.io/cgwalters/ci-sandbox/sealed-app:latest
 
 # Container name used by crun
 SEALED_APP_NAME=sealed-httpd

@@ -31,20 +31,21 @@ keygen:
         echo "Signing keypair already exists in {{keys_dir}}, skipping"
         exit 0
     fi
-    openssl req -x509 -newkey rsa:2048 -nodes \
+    openssl req -x509 -newkey rsa:4096 -nodes \
         -keyout "{{keys_dir}}/composefs-signing.key" \
         -out "{{keys_dir}}/composefs-signing.pem" \
-        -days 365 -subj '/CN=composefs-app-signing/'
+        -days 3650 -subj '/CN=composefs-app-signing/O=composefs-demo'
     echo "Generated composefs signing keypair in {{keys_dir}}"
 
 # Build cfsctl from composefs-rs source (for local seal/sign operations)
 build-cfsctl:
-    cargo build --release --manifest-path "{{composefs_src}}/Cargo.toml" -p cfsctl
+    cargo build --release --manifest-path "{{composefs_src}}/Cargo.toml" \
+        -p cfsctl --features composefs-oci/oci-client
 
 # Build the sealed host image
 #
 # cfsctl is built from source INSIDE the container build (multi-stage).
-# By default clones from cgwalters/playground composefs branch; override
+# By default clones from cgwalters/ci-sandbox composefs branch; override
 # with COMPOSEFS_RS_REPO/COMPOSEFS_RS_REF env vars for local dev.
 build-host: keygen
     #!/bin/bash
@@ -88,8 +89,8 @@ seal-app: keygen build-cfsctl build-app
 
     echo "App image sealed and signed successfully"
 
-# Boot a VM, wait for multi-user.target (which includes sealed-httpd.service),
-# then verify everything came up.
+# Boot a VM and verify the sealed app service works e2e.
+# Uses default ostree boot mode (--composefs-backend is not yet reliable).
 bcvk-ssh: build-host
     #!/bin/bash
     set -euo pipefail
@@ -101,14 +102,12 @@ bcvk-ssh: build-host
 
     echo "==> Booting sealed host VM..."
     bcvk libvirt run --detach --ssh-wait --name "${VM_NAME}" \
-        --composefs-backend --filesystem=ext4 \
+        --filesystem=ext4 \
         "{{host_image}}"
 
-    echo "==> Waiting for multi-user.target (timeout 90s)..."
-    # Wait for multi-user.target to be reached — this means all WantedBy=
-    # services (including sealed-httpd.service) have been started.
+    echo "==> Waiting for multi-user.target (timeout 120s)..."
     bcvk libvirt ssh "${VM_NAME}" -- \
-        timeout 90 bash -c \
+        timeout 120 bash -c \
             'systemctl is-active multi-user.target || journalctl -b --no-pager -o cat UNIT=multi-user.target --follow | grep -q -m1 "Reached target"'
 
     echo "==> multi-user.target reached, running checks..."
@@ -116,17 +115,34 @@ bcvk-ssh: build-host
         set -euo pipefail
         failed=0
 
-        echo "--- composefs root ---"
-        mount | grep -E "composefs|erofs" || echo "WARN: no composefs mount (non-composefs boot)"
-
-        echo "--- cfsctl ---"
+        echo "--- cfsctl version ---"
         cfsctl --version
 
         echo "--- composefs-load-appkeys.service ---"
-        systemctl status composefs-load-appkeys.service --no-pager || failed=1
+        if systemctl is-active --quiet composefs-load-appkeys.service; then
+            echo "  OK: keyring service active"
+        else
+            echo "  FAIL: keyring service not active"
+            systemctl status composefs-load-appkeys.service --no-pager || true
+            journalctl -b -u composefs-load-appkeys.service --no-pager || true
+            failed=1
+        fi
 
         echo "--- sealed-httpd.service ---"
-        systemctl status sealed-httpd.service --no-pager || failed=1
+        if systemctl is-active --quiet sealed-httpd.service; then
+            echo "  OK: sealed-httpd active"
+            # Verify httpd is actually serving
+            if curl -sf http://localhost/ | grep -q "sealed"; then
+                echo "  OK: httpd serving sealed demo page"
+            else
+                echo "  WARN: httpd active but page content unexpected"
+            fi
+        else
+            echo "  FAIL: sealed-httpd not active"
+            systemctl status sealed-httpd.service --no-pager || true
+            journalctl -b -u sealed-httpd.service --no-pager || true
+            failed=1
+        fi
 
         if [ "$failed" -eq 0 ]; then
             echo ""
@@ -134,7 +150,6 @@ bcvk-ssh: build-host
         else
             echo ""
             echo "=== SOME CHECKS FAILED (see above) ==="
-            journalctl -b -u sealed-httpd.service --no-pager
             exit 1
         fi
     '

@@ -11,15 +11,23 @@ BUNDLE="/run/sealed-apps/${SEALED_APP_NAME}"
 ROOTFS="${BUNDLE}/rootfs"
 CERT="/usr/lib/composefs/app-signing-cert.pem"
 
+# NOTE: --insecure skips fsverity enforcement on individual object files.
+# The signature verification (--require-signature) still checks PKCS#7
+# signatures against the trusted certificate — it's only the per-file
+# fsverity that's skipped. In production, drop --insecure once the
+# filesystem and kernel fully support fsverity.
+
 # 1. Ensure composefs repo exists
 mkdir -p "${COMPOSEFS_REPO}"
 cfsctl --insecure --repo "${COMPOSEFS_REPO}" init
 
-# 2. Pull the image into the composefs repo
+# 2. Pull the image (and its signature referrer artifacts) into the composefs repo
+echo "Pulling sealed image: ${SEALED_APP_IMAGE}"
 cfsctl --insecure --repo "${COMPOSEFS_REPO}" oci pull "${SEALED_APP_IMAGE}" "${SEALED_APP_NAME}"
 
 # 3. Mount with signature verification
 mkdir -p "${ROOTFS}"
+echo "Mounting with signature verification..."
 cfsctl --insecure --repo "${COMPOSEFS_REPO}" oci mount \
     --require-signature --trust-cert "${CERT}" \
     "${SEALED_APP_NAME}" "${ROOTFS}"
