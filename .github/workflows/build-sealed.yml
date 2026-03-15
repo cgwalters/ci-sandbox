@@ -113,7 +113,7 @@ jobs:
             ${APP_IMAGE}:latest
 
           echo "==> Verify referrers are discoverable"
-          oras discover ${APP_IMAGE}:latest
+          oras discover --format tree ${APP_IMAGE}:latest
 
       # -- Build and push the host image --
       - name: Prepare signing cert for host build
