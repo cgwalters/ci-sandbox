@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Basic check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "CI passed for $(git rev-parse --short HEAD)"
+
+  # Sentinel job — this is the single required status check
+  # for branch protection / merge queue.
+  required-checks:
+    if: always()
+    needs: [check]
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 1
+        if: needs.check.result != 'success'
