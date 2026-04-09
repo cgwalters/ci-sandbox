@@ -224,10 +224,11 @@ jobs:
           echo "=== Phase 5: Heavy pod + nested container operations ==="
           # This more closely mimics devaipod: pod with infra + app container + exec
           pids=()
-          for i in $(seq 1 15); do
+                    for i in $(seq 1 30);
+ do
             (
               name="heavy-$i"
-              podman pod create --name "pod-$name" --publish "0:8080" 2>&1 || { echo "FAILED pod create: $name"; exit 1; }
+              podman pod create --name "pod-$name" --publish 8080 2>&1 || { echo "FAILED pod create: $name"; exit 1; }
               podman run -d --pod "pod-$name" --name "${name}-app" alpine sh -c 'sleep 60' 2>&1 || { echo "FAILED run app: $name"; exit 1; }
               podman run -d --pod "pod-$name" --name "${name}-sidecar" alpine sh -c 'sleep 60' 2>&1 || { echo "FAILED run sidecar: $name"; exit 1; }
               # Exec into container (like devaipod does for agent commands)
@@ -237,10 +238,10 @@ jobs:
               podman port "pod-$name" 2>&1 || echo "WARN: port query failed for $name"
             ) &
             pids+=($!)
-            if [ $((i % 5)) -eq 0 ]; then
+            if [ $((i % 10)) -eq 0 ]; then
               for pid in "${pids[@]}"; do wait "$pid" || true; done
               pids=()
-              echo "Heavy batch $(( i / 5 )) done"
+              echo "Heavy batch $(( i / 10 )) done"
             fi
           done
           for pid in "${pids[@]}"; do wait "$pid" || true; done
@@ -249,6 +250,40 @@ jobs:
           echo "=== Phase 6: Concurrent cleanup of all pods ==="
           podman pod ls --format '{{.Name}}' | xargs -P4 -I{} podman pod rm -f {} 2>&1 || true
           echo "All pods cleaned up"
+
+          echo ""
+          echo "=== Phase 7: Containerized stress - 3 waves of 20 pods (60 total, accumulated) ==="
+          for wave in 1 2 3; do
+            echo "--- Wave $wave: creating 20 pods ---"
+            pids=()
+            for i in $(seq 1 20); do
+              idx=$(( (wave-1)*20 + i ))
+              (
+                name="wave-${wave}-${i}"
+                podman pod create --name "pod-$name" --publish 8080 2>&1 || { echo "FAILED pod create: $name"; exit 1; }
+                podman run -d --pod "pod-$name" --name "${name}-app" alpine sh -c 'sleep 120' 2>&1 || { echo "FAILED run: $name"; exit 1; }
+                # Concurrent exec + port inspect (fire both at once)
+                podman exec "${name}-app" echo "exec in $name" 2>&1 &
+                podman port "pod-$name" 2>&1 &
+                wait
+              ) &
+              pids+=($!)
+              # 10 at a time
+              if [ $((i % 10)) -eq 0 ]; then
+                for pid in "${pids[@]}"; do wait "$pid" || true; done
+                pids=()
+                echo "  Wave $wave batch $((i/10)) done"
+              fi
+            done
+            for pid in "${pids[@]}"; do wait "$pid" || true; done
+            echo "Wave $wave complete, pods accumulated: $((wave * 20))"
+            echo "Current pod count: $(podman pod ls -q | wc -l)"
+          done
+
+          echo ""
+          echo "=== Phase 7b: Massive concurrent cleanup of all 60 pods ==="
+          podman pod ls --format '{{.Name}}' | xargs -P20 -I{} podman pod rm -f {} 2>&1 || true
+          echo "All 60 pods cleaned up"
 
       - name: Check podman service health after stress
         if: always()
@@ -329,8 +364,8 @@ jobs:
               echo ""
 
               # Phase A: Concurrent pod create from inside container (20 pods)
-              echo "Phase A: Creating 20 pods concurrently from inside container..."
-              for i in $(seq 1 20); do
+              echo "Phase A: Creating 40 pods concurrently from inside container..."
+              for i in $(seq 1 40); do
                 (
                   # Create pod via API
                   curl -s --unix-socket $SOCK -X POST \
@@ -360,7 +395,7 @@ jobs:
 
               # Phase B: Concurrent inspections + event stream
               echo "Phase B: Concurrent inspect/list operations..."
-              for i in $(seq 1 30); do
+              for i in $(seq 1 40); do
                 (
                   curl -s --unix-socket $SOCK "http://d/v5.0.0/libpod/pods/json" >/dev/null 2>&1
                   curl -s --unix-socket $SOCK "http://d/v5.0.0/libpod/containers/json?all=true" >/dev/null 2>&1
@@ -371,7 +406,7 @@ jobs:
 
               # Phase C: Concurrent pod removal
               echo "Phase C: Removing all pods concurrently..."
-              for i in $(seq 1 20); do
+              for i in $(seq 1 40); do
                 curl -s --unix-socket $SOCK -X DELETE \
                   "http://d/v5.0.0/libpod/pods/nested-pod-$i?force=true" &
               done
