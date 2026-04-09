@@ -224,8 +224,7 @@ jobs:
           echo "=== Phase 5: Heavy pod + nested container operations ==="
           # This more closely mimics devaipod: pod with infra + app container + exec
           pids=()
-                    for i in $(seq 1 30);
- do
+          for i in $(seq 1 30); do
             (
               name="heavy-$i"
               podman pod create --name "pod-$name" --publish 8080 2>&1 || { echo "FAILED pod create: $name"; exit 1; }
