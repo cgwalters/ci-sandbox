@@ -2,8 +2,9 @@ name: Investigate podman segfault
 
 # Reproduces the podman segfault seen in devaipod CI:
 #   https://github.com/cgwalters/devaipod/actions/runs/24162742432/job/70657203104
-# The crash was: Segmentation fault (core dumped) podman system service --time=120
-# This workflow instruments podman to capture diagnostics.
+# The crash is triggered by concurrent HTTP API calls through the podman socket
+# (via bollard/hyper), not CLI commands. This workflow uses aiohttp with
+# persistent connections to mimic what devaipod's Rust code does.
 
 on:
   push:
@@ -17,7 +18,7 @@ env:
 
 jobs:
   podman-stress:
-    name: Podman concurrent stress test
+    name: Podman API stress test
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -32,38 +33,15 @@ jobs:
       - name: Collect baseline environment
         run: |
           set -x
-          echo "=== Podman version ==="
           podman version
-          echo "=== Podman info ==="
           podman info
-          echo "=== crun version ==="
-          crun --version || true
-          echo "=== Kernel version ==="
           uname -a
-          echo "=== cgroup setup ==="
-          cat /proc/self/cgroup
-          mount | grep cgroup
-          echo "=== Open file descriptors (init) ==="
-          ls /proc/self/fd | wc -l
-          echo "=== Memory ==="
-          free -m
-          echo "=== ulimits ==="
-          ulimit -a
-          echo "=== Core dump settings ==="
-          cat /proc/sys/kernel/core_pattern
-          ulimit -c
-          echo "=== /etc/containers/ ==="
-          ls -la /etc/containers/ || true
-          cat /etc/containers/registries.conf 2>/dev/null | head -20 || true
-          cat /etc/containers/storage.conf 2>/dev/null | head -30 || true
-          cat /etc/containers/containers.conf 2>/dev/null | head -30 || true
+          crun --version || true
 
       # ── Enable coredumps ──────────────────────────────────────────
       - name: Configure coredump capture
         run: |
-          # Enable unlimited core dumps
           ulimit -c unlimited
-          # Use systemd-coredump if available, otherwise /tmp
           if command -v coredumpctl &>/dev/null; then
             echo "systemd-coredump available"
             sudo sysctl -w kernel.core_pattern='|/usr/lib/systemd/systemd-coredump %P %u %g %s %t %c %h'
@@ -72,19 +50,22 @@ jobs:
           fi
           cat /proc/sys/kernel/core_pattern
 
-      - name: Pull test image
-        run: podman pull docker.io/library/alpine:latest
+      - name: Pull test images
+        run: |
+          podman pull docker.io/library/alpine:latest
+          podman pull ghcr.io/bootc-dev/devenv-debian:latest
+
+      - name: Install Python dependencies for HTTP stress test
+        run: pip3 install requests-unixsocket2 aiohttp
 
       # ── Start podman service (mimics devaipod CI) ─────────────────
-      - name: Start instrumented podman service
+      - name: Start podman service with monitoring
         id: podman-service
         run: |
           set -euo pipefail
           SOCKET="/tmp/podman-stress-test/podman.sock"
           mkdir -p "$(dirname "$SOCKET")"
 
-          echo "=== Starting podman system service ==="
-          # Start with SIGABRT-on-segfault via LD_PRELOAD trick? No, just monitor.
           podman system service --time=0 "unix://$SOCKET" &
           PODMAN_PID=$!
           echo "podman_pid=$PODMAN_PID" >> "$GITHUB_OUTPUT"
@@ -102,11 +83,7 @@ jobs:
           curl --unix-socket "$SOCKET" http://d/v5.0.0/libpod/_ping
           echo ""
 
-      # ── Background monitor ────────────────────────────────────────
-      - name: Start podman health monitor
-        run: |
-          PODMAN_PID="${{ steps.podman-service.outputs.podman_pid }}"
-          SOCKET="${{ steps.podman-service.outputs.socket }}"
+          # Start background health monitor
           cat > /tmp/monitor-podman.sh << 'MONITOR'
           #!/bin/bash
           set -u
@@ -119,23 +96,19 @@ jobs:
             iteration=$((iteration + 1))
             ts=$(date +%H:%M:%S.%N)
 
-            # Check if process is still alive
             if ! kill -0 "$PODMAN_PID" 2>/dev/null; then
               echo "$ts PODMAN PROCESS DIED (PID=$PODMAN_PID)" | tee -a "$LOGFILE"
-              # Check for coredump
               if command -v coredumpctl &>/dev/null; then
                 echo "$ts Checking coredumpctl..." | tee -a "$LOGFILE"
                 coredumpctl list 2>&1 | tee -a "$LOGFILE"
                 coredumpctl info "$PODMAN_PID" 2>&1 | tee -a "$LOGFILE" || true
               fi
               ls -la /tmp/core.* 2>/dev/null | tee -a "$LOGFILE" || true
-              # Check exit status
               wait "$PODMAN_PID" 2>/dev/null
               echo "$ts Exit status: $?" | tee -a "$LOGFILE"
               break
             fi
 
-            # Every 5 iterations, log resource usage
             if [ $((iteration % 5)) -eq 0 ]; then
               {
                 echo "$ts iter=$iteration podman_alive=true"
@@ -154,135 +127,218 @@ jobs:
           nohup /tmp/monitor-podman.sh "$PODMAN_PID" "$SOCKET" &
           echo "Monitor started in background"
 
-      # ── Stress test: concurrent container operations ──────────────
-      - name: "Stress test: concurrent container lifecycle"
+      # ── HTTP API stress test ──────────────────────────────────────
+      - name: "HTTP API stress test (mimics devaipod bollard pattern)"
+        env:
+          PODMAN_SOCKET: ${{ steps.podman-service.outputs.socket }}
         run: |
-          set -euo pipefail
-          SOCKET="${{ steps.podman-service.outputs.socket }}"
-          export DOCKER_HOST="unix://$SOCKET"
+          cat > /tmp/stress-test.py << 'PYEOF'
+          #!/usr/bin/env python3
+          """Stress test podman via HTTP API, mimicking devaipod's bollard client pattern."""
+          import asyncio
+          import aiohttp
+          import json
+          import os
+          import sys
+          import time
 
-          echo "=== Phase 1: Sequential warm-up (5 containers) ==="
-          for i in $(seq 1 5); do
-            name="warmup-$i"
-            podman run --rm --name "$name" alpine echo "warmup $i" || echo "FAILED: $name"
-          done
-          echo "Sequential warm-up done"
+          SOCKET = os.environ["PODMAN_SOCKET"]
+          BASE = "http://d/v5.0.0/libpod"
 
-          echo ""
-          echo "=== Phase 2: Concurrent create+start (20 containers, 4 at a time) ==="
-          # This mimics what devaipod integration tests do: many pods created concurrently
-          pids=()
-          for batch in $(seq 1 5); do
-            for j in $(seq 1 4); do
-              i=$(( (batch-1)*4 + j ))
-              (
-                name="stress-$i"
-                # Create a pod (like devaipod does)
-                podman pod create --name "pod-$name" 2>&1 || echo "FAILED pod create: $name"
-                # Run container in the pod
-                podman run -d --pod "pod-$name" --name "$name" alpine sleep 30 2>&1 || echo "FAILED run: $name"
-                # Immediately inspect
-                podman pod inspect "pod-$name" >/dev/null 2>&1 || echo "FAILED inspect: $name"
-              ) &
-              pids+=($!)
-            done
-            # Wait for this batch
-            for pid in "${pids[@]}"; do
-              wait "$pid" || true
-            done
-            pids=()
-            echo "Batch $batch done"
-          done
+          async def create_pod_with_containers(session, pod_name, image="docker.io/library/alpine:latest"):
+              """Mimics devaipod's pod creation: pod + multiple containers + published port."""
+              # Create pod with published port (like devaipod does -p 0.0.0.0::8090)
+              r = await session.post(f"{BASE}/pods/create", json={
+                  "name": pod_name,
+                  "portmappings": [{"container_port": 8090, "host_port": 0, "protocol": "tcp"}],
+                  "labels": {"io.devaipod.instance": "stress-test"},
+              })
+              if r.status != 200:
+                  print(f"FAIL pod create {pod_name}: {r.status} {await r.text()}")
+                  return False
 
-          echo ""
-          echo "=== Phase 3: Concurrent stop+remove ==="
-          podman pod ls --format '{{.Name}}' | while read pod; do
-            podman pod rm -f "$pod" &
-          done
-          wait
-          echo "Cleanup done"
+              # Create app container in pod
+              r = await session.post(f"{BASE}/containers/create", json={
+                  "name": f"{pod_name}-app",
+                  "image": image,
+                  "pod": pod_name,
+                  "command": ["sleep", "120"],
+              })
+              if r.status not in (200, 201):
+                  print(f"FAIL container create {pod_name}-app: {r.status}")
+                  return False
 
-          echo ""
-          echo "=== Phase 4: Rapid create/destroy cycles (50 iterations) ==="
-          for i in $(seq 1 50); do
-            (
-              name="rapid-$i"
-              podman pod create --name "pod-$name" 2>/dev/null
-              podman run --rm --pod "pod-$name" --name "$name" alpine echo "rapid $i" 2>/dev/null
-              podman pod rm -f "pod-$name" 2>/dev/null
-            ) &
-            # Run 10 at a time
-            if [ $((i % 10)) -eq 0 ]; then
-              wait
-              echo "Rapid batch $i done"
-            fi
-          done
-          wait
-          echo "Rapid cycles done"
+              # Create sidecar container in pod
+              r = await session.post(f"{BASE}/containers/create", json={
+                  "name": f"{pod_name}-sidecar",
+                  "image": image,
+                  "pod": pod_name,
+                  "command": ["sleep", "120"],
+              })
+              if r.status not in (200, 201):
+                  print(f"FAIL sidecar create {pod_name}: {r.status}")
+                  return False
 
-          echo ""
-          echo "=== Phase 5: Heavy pod + nested container operations ==="
-          # This more closely mimics devaipod: pod with infra + app container + exec
-          pids=()
-          for i in $(seq 1 30); do
-            (
-              name="heavy-$i"
-              podman pod create --name "pod-$name" --publish 8080 2>&1 || { echo "FAILED pod create: $name"; exit 1; }
-              podman run -d --pod "pod-$name" --name "${name}-app" alpine sh -c 'sleep 60' 2>&1 || { echo "FAILED run app: $name"; exit 1; }
-              podman run -d --pod "pod-$name" --name "${name}-sidecar" alpine sh -c 'sleep 60' 2>&1 || { echo "FAILED run sidecar: $name"; exit 1; }
-              # Exec into container (like devaipod does for agent commands)
-              podman exec "${name}-app" echo "exec in $name" 2>&1 || echo "WARN: exec failed for $name"
-              # Inspect published ports
-              podman pod inspect "pod-$name" --format '{{.InfraContainerId}}' 2>&1 || echo "WARN: inspect failed for $name"
-              podman port "pod-$name" 2>&1 || echo "WARN: port query failed for $name"
-            ) &
-            pids+=($!)
-            if [ $((i % 10)) -eq 0 ]; then
-              for pid in "${pids[@]}"; do wait "$pid" || true; done
-              pids=()
-              echo "Heavy batch $(( i / 10 )) done"
-            fi
-          done
-          for pid in "${pids[@]}"; do wait "$pid" || true; done
+              # Start the pod
+              r = await session.post(f"{BASE}/pods/{pod_name}/start")
+              if r.status not in (200, 204, 304):
+                  print(f"FAIL pod start {pod_name}: {r.status} {await r.text()}")
+                  return False
 
-          echo ""
-          echo "=== Phase 6: Concurrent cleanup of all pods ==="
-          podman pod ls --format '{{.Name}}' | xargs -P4 -I{} podman pod rm -f {} 2>&1 || true
-          echo "All pods cleaned up"
+              return True
 
-          echo ""
-          echo "=== Phase 7: Containerized stress - 3 waves of 20 pods (60 total, accumulated) ==="
-          for wave in 1 2 3; do
-            echo "--- Wave $wave: creating 20 pods ---"
-            pids=()
-            for i in $(seq 1 20); do
-              idx=$(( (wave-1)*20 + i ))
-              (
-                name="wave-${wave}-${i}"
-                podman pod create --name "pod-$name" --publish 8080 2>&1 || { echo "FAILED pod create: $name"; exit 1; }
-                podman run -d --pod "pod-$name" --name "${name}-app" alpine sh -c 'sleep 120' 2>&1 || { echo "FAILED run: $name"; exit 1; }
-                # Concurrent exec + port inspect (fire both at once)
-                podman exec "${name}-app" echo "exec in $name" 2>&1 &
-                podman port "pod-$name" 2>&1 &
-                wait
-              ) &
-              pids+=($!)
-              # 10 at a time
-              if [ $((i % 10)) -eq 0 ]; then
-                for pid in "${pids[@]}"; do wait "$pid" || true; done
-                pids=()
-                echo "  Wave $wave batch $((i/10)) done"
-              fi
-            done
-            for pid in "${pids[@]}"; do wait "$pid" || true; done
-            echo "Wave $wave complete, pods accumulated: $((wave * 20))"
-            echo "Current pod count: $(podman pod ls -q | wc -l)"
-          done
+          async def inspect_and_exec(session, pod_name):
+              """Mimics devaipod's post-create operations."""
+              # Inspect pod
+              await session.get(f"{BASE}/pods/{pod_name}/json")
+              # List containers
+              await session.get(f"{BASE}/containers/json", params={"all": "true", "pod": pod_name})
+              # Try exec in app container
+              r = await session.post(f"{BASE}/containers/{pod_name}-app/exec", json={
+                  "Cmd": ["echo", "hello"],
+                  "AttachStdout": True,
+              })
+              if r.status == 201:
+                  data = await r.json()
+                  exec_id = data.get("Id", "")
+                  if exec_id:
+                      await session.post(f"{BASE}/exec/{exec_id}/start", json={"Detach": False})
 
-          echo ""
-          echo "=== Phase 7b: Massive concurrent cleanup of all 60 pods ==="
-          podman pod ls --format '{{.Name}}' | xargs -P20 -I{} podman pod rm -f {} 2>&1 || true
-          echo "All 60 pods cleaned up"
+          async def remove_pod(session, pod_name):
+              """Force remove a pod."""
+              await session.delete(f"{BASE}/pods/{pod_name}", params={"force": "true"})
+
+          async def event_watcher(session, stop_event):
+              """Mimics devaipod's persistent event stream (bollard docker.events())."""
+              while not stop_event.is_set():
+                  try:
+                      async with session.get(f"{BASE}/../events", params={
+                          "filters": json.dumps({"type": ["container"]}),
+                      }) as resp:
+                          async for line in resp.content:
+                              if stop_event.is_set():
+                                  break
+                              # Just consume events like devaipod does
+                  except Exception as e:
+                      if not stop_event.is_set():
+                          print(f"Event watcher error: {e}, reconnecting in 1s")
+                          await asyncio.sleep(1)
+
+          async def list_pods(session):
+              """Mimics devaipod's pod listing via libpod API."""
+              r = await session.get(f"{BASE}/pods/json")
+              if r.status == 200:
+                  return await r.json()
+              return []
+
+          async def main():
+              socket = os.environ["PODMAN_SOCKET"]
+              conn = aiohttp.UnixConnector(path=socket)
+              timeout = aiohttp.ClientTimeout(total=30)
+
+              async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
+                  # Verify connectivity
+                  r = await session.get(f"{BASE}/_ping")
+                  print(f"Ping: {await r.text()}")
+
+                  stop_event = asyncio.Event()
+
+                  # Start 3 event watchers (like devaipod web + multiple harness instances)
+                  watchers = [asyncio.create_task(event_watcher(session, stop_event)) for _ in range(3)]
+
+                  # Phase 1: Concurrent pod creation (20 pods, 5 at a time)
+                  print("\n=== Phase 1: Concurrent pod creation (20 pods) ===")
+                  for batch in range(4):
+                      tasks = []
+                      for i in range(5):
+                          idx = batch * 5 + i + 1
+                          tasks.append(create_pod_with_containers(session, f"stress-{idx}"))
+                      results = await asyncio.gather(*tasks, return_exceptions=True)
+                      print(f"  Batch {batch+1}: {sum(1 for r in results if r is True)}/5 succeeded")
+
+                  # Phase 2: Concurrent inspect+exec+list (like devaipod polling)
+                  print("\n=== Phase 2: Concurrent inspect + exec + list ===")
+                  tasks = []
+                  for i in range(1, 21):
+                      tasks.append(inspect_and_exec(session, f"stress-{i}"))
+                  for _ in range(10):  # 10 concurrent pod list calls
+                      tasks.append(list_pods(session))
+                  await asyncio.gather(*tasks, return_exceptions=True)
+                  print("  Done")
+
+                  # Phase 3: Create 20 MORE pods while first 20 still running
+                  print("\n=== Phase 3: 20 more pods (40 total) ===")
+                  for batch in range(4):
+                      tasks = []
+                      for i in range(5):
+                          idx = 20 + batch * 5 + i + 1
+                          tasks.append(create_pod_with_containers(session, f"stress-{idx}"))
+                      results = await asyncio.gather(*tasks, return_exceptions=True)
+                      print(f"  Batch {batch+1}: {sum(1 for r in results if r is True)}/5 succeeded")
+
+                  # Phase 4: Massive concurrent operations on all 40 pods
+                  print("\n=== Phase 4: Concurrent operations on 40 pods ===")
+                  tasks = []
+                  for i in range(1, 41):
+                      tasks.append(inspect_and_exec(session, f"stress-{i}"))
+                      tasks.append(list_pods(session))
+                  await asyncio.gather(*tasks, return_exceptions=True)
+                  print("  Done")
+
+                  # Phase 5: Concurrent removal of all 40 pods
+                  print("\n=== Phase 5: Concurrent removal of 40 pods ===")
+                  tasks = [remove_pod(session, f"stress-{i}") for i in range(1, 41)]
+                  await asyncio.gather(*tasks, return_exceptions=True)
+                  print("  Done")
+
+                  # Phase 6: Rapid create/destroy cycles (3 rounds of 20)
+                  print("\n=== Phase 6: Rapid create/destroy cycles ===")
+                  for rnd in range(3):
+                      creates = [create_pod_with_containers(session, f"rapid-{rnd}-{i}") for i in range(20)]
+                      await asyncio.gather(*creates, return_exceptions=True)
+                      removes = [remove_pod(session, f"rapid-{rnd}-{i}") for i in range(20)]
+                      await asyncio.gather(*removes, return_exceptions=True)
+                      print(f"  Round {rnd+1} done")
+
+                  # Phase 7: Use the larger image (ghcr.io/bootc-dev/devenv-debian)
+                  print("\n=== Phase 7: Larger image stress (devenv-debian) ===")
+                  tasks = [create_pod_with_containers(session, f"big-{i}", "ghcr.io/bootc-dev/devenv-debian:latest") for i in range(10)]
+                  results = await asyncio.gather(*tasks, return_exceptions=True)
+                  print(f"  Created {sum(1 for r in results if r is True)}/10")
+                  # Concurrent ops
+                  tasks = [inspect_and_exec(session, f"big-{i}") for i in range(10)]
+                  tasks += [list_pods(session) for _ in range(20)]
+                  await asyncio.gather(*tasks, return_exceptions=True)
+                  # Cleanup
+                  tasks = [remove_pod(session, f"big-{i}") for i in range(10)]
+                  await asyncio.gather(*tasks, return_exceptions=True)
+                  print("  Done")
+
+                  stop_event.set()
+                  for w in watchers:
+                      w.cancel()
+
+                  # Final health check
+                  try:
+                      r = await session.get(f"{BASE}/_ping")
+                      print(f"\nFinal ping: {await r.text()}")
+                  except Exception as e:
+                      print(f"\n*** FINAL PING FAILED: {e} ***")
+
+          asyncio.run(main())
+          PYEOF
+          python3 /tmp/stress-test.py
+
+      # ── Nested container stress (mimics devaipod CI) ──────────────
+      - name: "Nested container stress test (mimics devaipod CI)"
+        env:
+          PODMAN_SOCKET: ${{ steps.podman-service.outputs.socket }}
+        run: |
+          podman run --rm --privileged --pids-limit=-1 \
+            -v "$PODMAN_SOCKET":/run/docker.sock \
+            -v /tmp/stress-test.py:/stress-test.py:ro \
+            docker.io/library/python:3.12-slim \
+            bash -c "pip install aiohttp && PODMAN_SOCKET=/run/docker.sock python3 /stress-test.py"
 
       - name: Check podman service health after stress
         if: always()
@@ -323,110 +379,6 @@ jobs:
           echo "=== journalctl podman (last 100 lines) ==="
           journalctl --user -u 'podman*' --no-pager -n 100 2>&1 || true
 
-      # ── Second round: nested container stress (mimics devaipod CI) ─
-      # devaipod's CI runs integration tests inside a container that
-      # talks back to the host podman via a mounted socket. This nesting
-      # may be the key trigger for the segfault.
-      - name: "Nested container stress test (mimics devaipod CI)"
-        run: |
-          set -euo pipefail
-          PODMAN_PID="${{ steps.podman-service.outputs.podman_pid }}"
-          SOCKET="${{ steps.podman-service.outputs.socket }}"
-
-          # Restart podman service fresh for this round
-          kill "$PODMAN_PID" 2>/dev/null || true
-          sleep 1
-
-          SOCKET="/tmp/podman-nested-test/podman.sock"
-          mkdir -p "$(dirname "$SOCKET")"
-          podman system service --time=0 "unix://$SOCKET" &
-          PODMAN_PID=$!
-          for i in $(seq 1 50); do [ -S "$SOCKET" ] && break; sleep 0.1; done
-          echo "Fresh podman service PID=$PODMAN_PID"
-
-          # Start monitor
-          nohup /tmp/monitor-podman.sh "$PODMAN_PID" "$SOCKET" &
-
-          # Run a container that hammers the host podman socket from inside
-          # This is the exact pattern devaipod CI uses:
-          #   outer container → mounts host podman socket → runs podman-remote → creates pods
-          podman run --rm --privileged --pids-limit=-1 \
-            -v "$SOCKET":/run/docker.sock \
-            -v /tmp:/tmp \
-            docker.io/library/alpine:latest sh -c '
-              apk add --no-cache curl jq bash >/dev/null 2>&1
-              SOCK=/run/docker.sock
-              echo "=== Nested container: hammering host podman socket ==="
-
-              # Verify connectivity
-              curl -s --unix-socket $SOCK http://d/v5.0.0/libpod/_ping
-              echo ""
-
-              # Phase A: Concurrent pod create from inside container (20 pods)
-              echo "Phase A: Creating 40 pods concurrently from inside container..."
-              for i in $(seq 1 40); do
-                (
-                  # Create pod via API
-                  curl -s --unix-socket $SOCK -X POST \
-                    "http://d/v5.0.0/libpod/pods/create" \
-                    -H "Content-Type: application/json" \
-                    -d "{\"name\": \"nested-pod-$i\"}" || echo "FAIL create nested-pod-$i"
-                  # Start pod
-                  curl -s --unix-socket $SOCK -X POST \
-                    "http://d/v5.0.0/libpod/pods/nested-pod-$i/start" || echo "FAIL start nested-pod-$i"
-                  # Create container in pod via API
-                  curl -s --unix-socket $SOCK -X POST \
-                    "http://d/v5.0.0/libpod/containers/create" \
-                    -H "Content-Type: application/json" \
-                    -d "{\"name\": \"nested-ctr-$i\", \"image\": \"docker.io/library/alpine:latest\", \"pod\": \"nested-pod-$i\", \"command\": [\"sleep\", \"30\"]}" || echo "FAIL create ctr $i"
-                  # Start container
-                  CID=$(curl -s --unix-socket $SOCK "http://d/v5.0.0/libpod/containers/nested-ctr-$i/json" 2>/dev/null | jq -r .Id 2>/dev/null || echo "")
-                  if [ -n "$CID" ] && [ "$CID" != "null" ]; then
-                    curl -s --unix-socket $SOCK -X POST \
-                      "http://d/v5.0.0/libpod/containers/$CID/start" || echo "FAIL start ctr $i"
-                  fi
-                ) &
-                # 5 at a time
-                if [ $((i % 5)) -eq 0 ]; then wait; echo "  batch $((i/5)) done"; fi
-              done
-              wait
-              echo "Phase A done"
-
-              # Phase B: Concurrent inspections + event stream
-              echo "Phase B: Concurrent inspect/list operations..."
-              for i in $(seq 1 40); do
-                (
-                  curl -s --unix-socket $SOCK "http://d/v5.0.0/libpod/pods/json" >/dev/null 2>&1
-                  curl -s --unix-socket $SOCK "http://d/v5.0.0/libpod/containers/json?all=true" >/dev/null 2>&1
-                ) &
-              done
-              wait
-              echo "Phase B done"
-
-              # Phase C: Concurrent pod removal
-              echo "Phase C: Removing all pods concurrently..."
-              for i in $(seq 1 40); do
-                curl -s --unix-socket $SOCK -X DELETE \
-                  "http://d/v5.0.0/libpod/pods/nested-pod-$i?force=true" &
-              done
-              wait
-              echo "Phase C done"
-
-              # Final check
-              echo "Final ping:"
-              curl -s --unix-socket $SOCK http://d/v5.0.0/libpod/_ping
-              echo ""
-            ' || echo "*** Nested container exited with error (podman may have crashed) ***"
-
-          echo ""
-          echo "=== Post-nested-test podman status ==="
-          if kill -0 "$PODMAN_PID" 2>/dev/null; then
-            echo "Podman ALIVE after nested stress test"
-          else
-            echo "*** PODMAN CRASHED during nested stress test ***"
-            sudo dmesg | grep -i segfault | tail -5 || true
-          fi
-
       - name: Collect final diagnostics
         if: always()
         run: |
@@ -441,7 +393,6 @@ jobs:
           echo "=== Coredumps ==="
           if command -v coredumpctl &>/dev/null; then
             coredumpctl list 2>&1 || echo "No coredumps"
-            # Try to get backtrace if there's a crash
             coredumpctl info 2>&1 | head -50 || true
           fi
           ls -la /tmp/core.* 2>/dev/null || echo "No core files"
